@@ -1,0 +1,282 @@
+name: Manual Publish Vulkan Build (Win64)
+run-name: Manual Publish - Vulkan SDK ${{ github.event.inputs.vulkan_version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: '发布版本号（示例：1.9.3）'
+        required: true
+        default: '1.9.3'
+        type: string
+      vulkan_version:
+        description: 'Vulkan SDK 版本（使用 "latest" 获取最新版）'
+        required: true
+        default: 'latest'
+        type: string
+      draft_release:
+        description: '创建草稿Release'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      prerelease:
+        description: '标记为预发布版本'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+jobs:
+  build-windows-vulkan:
+    runs-on: windows-2022
+    strategy:
+      matrix:
+        arch: [x64]
+        sdl2: [ON, OFF]
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Ninja, ccache, 7-Zip, CMake
+        run: |
+          choco install ninja ccache 7zip cmake -y
+          echo "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Add MSBuild to PATH
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Fetch SDL2 and set SDL2_DIR
+        if: matrix.sdl2 == 'ON'
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/libsdl-org/SDL/releases/download/release-2.30.10/SDL2-devel-2.30.10-VC.zip" -OutFile SDL2.zip
+          7z x SDL2.zip -oSDL2 -y
+          echo "SDL2_DIR=$pwd\SDL2\SDL2-2.30.10" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # --- 缓存 Vulkan SDK（避免重复下载和安装）---
+      - name: Cache Vulkan SDK
+        id: cache-vulkan
+        uses: actions/cache@v4
+        with:
+          path: C:\VulkanSDK\${{ github.event.inputs.vulkan_version }}
+          key: vulkan-sdk-${{ github.event.inputs.vulkan_version }}-windows
+
+      # --- 下载并安装 Vulkan SDK + Runtime（静默安装 + zip 解压合并）---
+      - name: Download and install Vulkan SDK
+        if: steps.cache-vulkan.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $VULKAN_VERSION = '${{ github.event.inputs.vulkan_version }}'
+          if ($VULKAN_VERSION -eq 'latest') { $VULKAN_VERSION = '1.4.357.0' }
+
+          # ========== 1. 安装 Vulkan SDK ==========
+          $INSTALLER_URL = "https://sdk.lunarg.com/sdk/download/$VULKAN_VERSION/windows/vulkansdk-windows-X64-$VULKAN_VERSION.exe"
+          $INSTALLER_PATH = "$pwd\VulkanSDK.exe"
+
+          Write-Host ">>> 下载 Vulkan SDK 安装包 (版本 $VULKAN_VERSION) ..."
+          Invoke-WebRequest -Uri $INSTALLER_URL -OutFile $INSTALLER_PATH
+
+          Write-Host ">>> 静默安装 Vulkan SDK ..."
+          Start-Process -FilePath $INSTALLER_PATH -ArgumentList "--accept-licenses --default-answer --confirm-command install" -Wait
+
+          Write-Host ">>> SDK 安装完成"
+
+          # ========== 2. 下载并解压 Vulkan Runtime ==========
+          $RUNTIME_URL = "https://sdk.lunarg.com/sdk/download/$VULKAN_VERSION/windows/VulkanRT-X64-$VULKAN_VERSION-Components.zip"
+          $ZIP_PATH = "$pwd\VulkanRT.zip"
+          $EXTRACT_DIR = "C:\VulkanRT"
+
+          Write-Host ">>> 下载 Vulkan Runtime 组件包 (版本 $VULKAN_VERSION) ..."
+          Invoke-WebRequest -Uri $RUNTIME_URL -OutFile $ZIP_PATH
+
+          Write-Host ">>> 解压 Runtime 组件到 $EXTRACT_DIR ..."
+          Expand-Archive -Path $ZIP_PATH -DestinationPath $EXTRACT_DIR -Force
+
+          # 查找 vulkan-1.dll（在 x64 子目录下）
+          $VULKAN_DLL = Get-ChildItem -Path $EXTRACT_DIR -Recurse -Filter "vulkan-1.dll" | Select-Object -First 1
+          if (-not $VULKAN_DLL) {
+              throw "解压后未找到 vulkan-1.dll"
+          }
+
+          $X64_DIR = $VULKAN_DLL.Directory.FullName
+          Write-Host ">>> 找到 x64 目录: $X64_DIR"
+
+          # SDK 的 Bin 目录（已存在）
+          $SDK_BIN_DIR = "C:\VulkanSDK\$VULKAN_VERSION\Bin"
+
+          if (-not (Test-Path $SDK_BIN_DIR)) {
+              throw "SDK Bin 目录不存在: $SDK_BIN_DIR"
+          }
+
+          # 将 x64 目录下的所有内容移动到 SDK 的 Bin 目录
+          Write-Host ">>> 移动 $X64_DIR 下的所有内容到 $SDK_BIN_DIR ..."
+          Get-ChildItem -Path $X64_DIR | Move-Item -Destination $SDK_BIN_DIR -Force
+
+          # 验证 vulkan-1.dll 现在在 SDK 的 Bin 目录下
+          if (-not (Test-Path "$SDK_BIN_DIR\vulkan-1.dll")) {
+              throw "移动后未找到 vulkan-1.dll"
+          }
+
+          Write-Host ">>> vulkan-1.dll 已移动到 SDK Bin 目录: $SDK_BIN_DIR\vulkan-1.dll"
+
+          # 删除临时的 Runtime 解压目录
+          Remove-Item $EXTRACT_DIR -Recurse -Force
+
+          # 清理 Runtime zip 包
+          Remove-Item $ZIP_PATH -Force
+
+          # 清理 SDK 安装包
+          Remove-Item $INSTALLER_PATH -Force
+
+          # ========== 3. 设置环境变量 ==========
+          $INSTALL_DIR = "C:\VulkanSDK\$VULKAN_VERSION"
+          echo "$INSTALL_DIR\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          echo "VULKAN_SDK=$INSTALL_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "VK_SDK_PATH=$INSTALL_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host ">>> Vulkan SDK 安装成功，路径: $INSTALL_DIR"
+
+          # 验证关键文件
+          if (Test-Path "$INSTALL_DIR\Include\vulkan\vulkan.h") {
+              Write-Host ">>> vulkan.h 验证通过"
+          } else {
+              Write-Host "!!! 警告：未找到 vulkan.h，CMake 可能找不到 Vulkan"
+          }
+
+      # --- 从缓存恢复时设置环境变量 ---
+      - name: Set Vulkan SDK environment (cache hit)
+        if: steps.cache-vulkan.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          $VULKAN_VERSION = '${{ github.event.inputs.vulkan_version }}'
+          if ($VULKAN_VERSION -eq 'latest') { $VULKAN_VERSION = '1.4.357.0' }
+
+          $INSTALL_DIR = "C:\VulkanSDK\$VULKAN_VERSION"
+
+          if (-not (Test-Path "$INSTALL_DIR\Bin\vulkan-1.dll")) {
+              Write-Host "!!! 缓存中未找到 vulkan-1.dll，尝试查找实际安装位置 ..."
+              $found_dir = Get-ChildItem "C:\VulkanSDK" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+              if ($found_dir -and (Test-Path "$($found_dir.FullName)\Bin\vulkan-1.dll")) {
+                  $INSTALL_DIR = $found_dir.FullName
+                  Write-Host ">>> 找到 SDK 目录: $INSTALL_DIR"
+              } else {
+                  throw "未找到 Vulkan SDK 缓存"
+              }
+          }
+
+          echo "$INSTALL_DIR\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          echo "VULKAN_SDK=$INSTALL_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          echo "VK_SDK_PATH=$INSTALL_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host ">>> Vulkan SDK 环境变量已设置: $INSTALL_DIR"
+
+      # --- 使用 Vulkan 后端构建 whisper.cpp ---
+      - name: Build whisper.cpp with Vulkan
+        shell: pwsh
+        run: |
+          # 设置 VS 环境
+          $vsdevcmd = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat"
+          cmd /c "`"$vsdevcmd`" -arch=x64 && set" | ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)') {
+                  [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+              }
+          }
+
+          Write-Host "VULKAN_SDK = $env:VULKAN_SDK"
+
+          # 清理旧构建目录
+          if (Test-Path build) { Remove-Item build -Recurse -Force }
+          mkdir build
+          cd build
+
+          # CMake 配置：启用 Vulkan 后端
+          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DWHISPER_SDL2=${{ matrix.sdl2 }}
+
+          # 构建
+          cmake --build .
+
+          Write-Host "===== 构建完成，输出文件列表 ====="
+          Get-ChildItem bin\*.exe, bin\*.dll
+
+      - name: Check ccache status after build
+        run: |
+          ccache -s
+
+      # --- 打包构建产物（包含 Vulkan 运行时 DLL）---
+      - name: Prepare artifacts
+        run: |
+          $VERSION = "${{ github.event.inputs.release_version }}"
+          $VULKAN_SDK_DIR = $env:VULKAN_SDK
+          $ZIP_NAME = "whisper-vulkan-${{ matrix.arch }}-sdl${{ matrix.sdl2 }}-v$VERSION.zip"
+          mkdir staging -Force
+
+          # 复制生成的可执行文件
+          Copy-Item build/bin/*.exe staging/ -ErrorAction SilentlyContinue
+          Copy-Item build/bin/*.dll staging/ -ErrorAction SilentlyContinue
+
+          # 如果启用了 SDL2，复制 SDL2.dll
+          if ('${{ matrix.sdl2 }}' -eq 'ON') {
+            Copy-Item "$env:SDL2_DIR\lib\x64\SDL2.dll" staging/
+          }
+
+          # 复制 Vulkan 运行时库 vulkan-1.dll（已在 SDK Bin 目录中）
+          $VULKAN_DLL_SRC = "$VULKAN_SDK_DIR\Bin\vulkan-1.dll"
+          if (Test-Path $VULKAN_DLL_SRC) {
+              Copy-Item $VULKAN_DLL_SRC staging/
+              Write-Host ">>> 已复制 Vulkan DLL: $VULKAN_DLL_SRC"
+          } else {
+              Write-Host "!!! 警告：未找到 vulkan-1.dll，请检查 Vulkan SDK"
+          }
+
+          # 打包
+          Compress-Archive -Path staging/* -DestinationPath "./$ZIP_NAME"
+          Write-Host "===== 打包文件列表 ====="
+          Get-ChildItem staging
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-vulkan-${{ matrix.arch }}-sdl${{ matrix.sdl2 }}
+          path: ./whisper-vulkan-*.zip
+
+  publish-release:
+    needs: build-windows-vulkan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Collect zip files
+        run: |
+          mv ./artifacts/*/*.zip ./
+          ls -la *.zip
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.event.inputs.release_version }}
+          name: Release v${{ github.event.inputs.release_version }} (Vulkan Windows)
+          body: |
+            ## Build Info
+            - Vulkan SDK Version: ${{ github.event.inputs.vulkan_version }}
+            - Arch: x64
+            - Build Platform: windows-2022
+            - SDL2 variants: ON / OFF
+            - Backend: Vulkan (via GGML_VULKAN)
+            - Powered by whisper.cpp
+          files: ./*.zip
+          draft: ${{ github.event.inputs.draft_release == 'true' }}
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
